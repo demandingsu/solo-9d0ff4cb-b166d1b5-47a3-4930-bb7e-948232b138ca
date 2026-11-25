@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    container_name: conversion-api
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/conversion.db
+    volumes:
+      - conversion-data:/data
+    restart: unless-stopped
+
+volumes:
+  conversion-data:
