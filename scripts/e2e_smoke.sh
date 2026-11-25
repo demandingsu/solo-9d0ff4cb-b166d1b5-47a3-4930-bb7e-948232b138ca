@@ -15,6 +15,8 @@ check() { # desc, condition(0=ok)
 
 post() { curl -s -X POST "$BASE/api/v1/batches" -H 'Content-Type: application/json' -d "$1"; }
 get() { curl -s -G "$BASE/api/v1/conversion" --data-urlencode "item_code=$ITEM" "$@"; }
+# Query any item: getq ITEM remaining --data-urlencode args...
+getq() { local ic="$1"; shift; curl -s -G "$BASE/api/v1/conversion" --data-urlencode "item_code=$ic" "$@"; }
 
 echo "== 1. 报送基础规则 1件=8盒, 1盒=6套 =="
 body=$(post "{\"item_code\":\"$ITEM\",\"rules\":[
@@ -77,6 +79,43 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/docs")
 [ "$code" = 200 ] && check "/docs HTTP 200" 0 || check "/docs ($code)" 1
 code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/openapi.json")
 [ "$code" = 200 ] && check "/openapi.json HTTP 200" 0 || check "/openapi.json ($code)" 1
+
+echo "== 8. 规则图缓存：同品项同日换单位对只构一张图 =="
+IC="E2E-CACHE-${ITEM}"
+post "{\"item_code\":\"$IC\",\"rules\":[
+ {\"rule_code\":\"K1\",\"from_unit\":\"件\",\"to_unit\":\"盒\",\"from_amount\":1,\"to_amount\":8,\"start_date\":\"2026-01-01\",\"end_date\":\"2026-12-31\"},
+ {\"rule_code\":\"K2\",\"from_unit\":\"盒\",\"to_unit\":\"套\",\"from_amount\":1,\"to_amount\":6,\"start_date\":\"2026-01-01\",\"end_date\":\"2026-12-31\"}]}" >/dev/null
+b0=$(curl -s "$BASE/health" | python3 -c "import sys,json;print(json.load(sys.stdin)['cache']['builds'])")
+getq "$IC" --data-urlencode "shipping_date=2026-06-01" --data-urlencode "from_unit=件" --data-urlencode "to_unit=套" >/dev/null
+getq "$IC" --data-urlencode "shipping_date=2026-06-01" --data-urlencode "from_unit=套" --data-urlencode "to_unit=件" >/dev/null
+getq "$IC" --data-urlencode "shipping_date=2026-06-01" --data-urlencode "from_unit=件" --data-urlencode "to_unit=盒" >/dev/null
+b1=$(curl -s "$BASE/health" | python3 -c "import sys,json;print(json.load(sys.stdin)['cache']['builds'])")
+h1=$(curl -s "$BASE/health" | python3 -c "import sys,json;print(json.load(sys.stdin)['cache']['hits'])")
+[ "$((b1-b0))" -eq 1 ] && check "三个单位对只构一张图 (builds +1)" 0 || check "构图次数 builds +$((b1-b0))" 1
+[ "$h1" -ge 2 ] && check "后两次查询命中缓存 (hits=$h1)" 0 || check "缓存命中 hits=$h1" 1
+
+echo "== 9. 通过批次精准失效（窗口首尾含），退回批次不失效 =="
+inv0=$(curl -s "$BASE/health" | python3 -c "import sys,json;print(json.load(sys.stdin)['cache']['invalidations'])")
+post "{\"item_code\":\"$IC\",\"rules\":[
+ {\"rule_code\":\"K3\",\"from_unit\":\"套\",\"to_unit\":\"托\",\"from_amount\":1,\"to_amount\":2,\"start_date\":\"2026-04-01\",\"end_date\":\"2026-08-31\"}]}" \
+ | python3 -c "import sys,json; assert json.load(sys.stdin)['status']=='accepted'"
+inv1=$(curl -s "$BASE/health" | python3 -c "import sys,json;print(json.load(sys.stdin)['cache']['invalidations'])")
+[ "$((inv1-inv0))" -eq 1 ] && check "窗口内恰好失效一个键 (invalidations +1)" 0 || check "失效次数 +$((inv1-inv0))" 1
+# 止日当天新规则有效：件->托 = 48*2 = 96/1
+getq "$IC" --data-urlencode "shipping_date=2026-08-31" --data-urlencode "from_unit=件" --data-urlencode "to_unit=托" \
+ | tee /tmp/e2e_q4.json
+python3 -c "import json; d=json.load(open('/tmp/e2e_q4.json')); assert d['available'] and d['factor']=='96/1'" \
+ && check "止日当天按新规则换算 96/1" 0 || check "止日新规则" 1
+# 窗口外一天：K3 无效，件->托 无路径
+getq "$IC" --data-urlencode "shipping_date=2026-09-01" --data-urlencode "from_unit=件" --data-urlencode "to_unit=托" \
+ | tee /tmp/e2e_q5.json
+python3 -c "import json; assert json.load(open('/tmp/e2e_q5.json'))['available'] is False" \
+ && check "窗口外仍无可用换算" 0 || check "窗口外换算" 1
+# 整批退回：invalidations 不增加
+post "{\"item_code\":\"$IC\",\"rules\":[
+ {\"rule_code\":\"K9\",\"from_unit\":\"件\",\"to_unit\":\"盒\",\"from_amount\":1,\"to_amount\":9,\"start_date\":\"2026-06-01\",\"end_date\":\"2026-06-30\"}]}" >/dev/null
+inv2=$(curl -s "$BASE/health" | python3 -c "import sys,json;print(json.load(sys.stdin)['cache']['invalidations'])")
+[ "$inv2" -eq "$inv1" ] && check "退回批次不触发失效" 0 || check "退回误失效" 1
 
 echo
 echo "结果: PASS=$pass FAIL=$fail"

@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, Query
 from sqlite3 import Connection
 
 from . import database as db
+from .cache import graph_cache
 from .rationals import frac_str
 from .schemas import (
     BatchIn,
@@ -170,6 +171,6 @@ def get_submissions(
     return result
 
 
-@app.get("/health", summary="健康检查", tags=["系统"])
+@app.get("/health", summary="健康检查（含规则图缓存统计）", tags=["系统"])
 def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "cache": graph_cache.stats()}

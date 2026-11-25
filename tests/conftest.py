@@ -12,6 +12,7 @@ os.environ["DB_PATH"] = _db_path
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app import database as db  # noqa: E402
+from app.cache import graph_cache  # noqa: E402
 from app.main import app  # noqa: E402
 
 
@@ -31,6 +32,9 @@ def clean_db():
     conn.execute("DELETE FROM sqlite_sequence")
     conn.commit()
     conn.close()
+    # The rule-graph cache is process memory and survives DB cleanup, so it
+    # must be reset explicitly to keep tests independent.
+    graph_cache.clear()
     yield
     # Request-scoped connections opened by the app are closed when each
     # request finishes; nothing else lingers on this thread.

@@ -9,6 +9,7 @@ from datetime import date
 from typing import List, Optional
 
 from . import database as db
+from .cache import graph_cache
 from .graph import build_adjacency, find_path
 from .rationals import frac_str, reduce_frac
 from .schemas import BatchIn, ConflictOut, PathOut
@@ -112,6 +113,15 @@ def submit_batch(conn: sqlite3.Connection, batch: BatchIn) -> SubmissionResult:
         submission_id = db.insert_submission(
             conn, batch.item_code, "accepted", codes, None
         )
+
+    # The transaction is committed at this point (context manager exit).
+    # Only now may cached graphs be invalidated: an invalidation followed by a
+    # rolled-back commit would throw away still-valid graphs, while committing
+    # without invalidating is impossible because the invalidation below cannot
+    # fail a committed transaction. Scope is the same item, days inside any
+    # new rule's [start, end] window — boundary days included.
+    windows = [(r.start_date, r.end_date) for r in candidates]
+    graph_cache.invalidate(batch.item_code, windows)
     return SubmissionResult(
         submission_id, "accepted", None, f"已接受并生效 {len(candidates)} 条规则"
     )
@@ -119,9 +129,19 @@ def submit_batch(conn: sqlite3.Connection, batch: BatchIn) -> SubmissionResult:
 
 def lookup_conversion(conn: sqlite3.Connection, item_code: str, shipping_date: date,
                       from_unit: str, to_unit: str):
-    rules = db.active_rules_on(conn, item_code, shipping_date)
-    adj = build_adjacency(rules)
-    path = find_path(adj, from_unit, to_unit)
+    key = (item_code, shipping_date)
+
+    def build_graph():
+        # Runs at most once per cache key (single-flight). Reads only the
+        # rules committed as of this statement: the rules a query sees form a
+        # single point-in-time snapshot, even if another batch commits later
+        # while the graph is being built.
+        rules = db.active_rules_on(conn, item_code, shipping_date)
+        adj = build_adjacency(rules)
+        return adj, tuple(sorted(r.rule_code for r in rules))
+
+    entry = graph_cache.get_or_build(key, build_graph)
+    path = find_path(entry.adj, from_unit, to_unit)
     if path is None:
         return None, (
             f"{shipping_date.isoformat()} 品项 {item_code} 没有可从 "
